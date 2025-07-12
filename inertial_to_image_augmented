@@ -1,0 +1,298 @@
+# 1_inertial_preprocessing_complete.py
+# Combina la generación de imágenes según el paper, el aumento de datos y la división del dataset.
+
+import os
+import shutil
+import scipy.io
+import numpy as np
+from PIL import Image, ImageEnhance
+from tqdm import tqdm
+import cv2
+from scipy.interpolate import interp1d
+import random
+from typing import Tuple
+import warnings
+from sklearn.model_selection import train_test_split
+from collections import defaultdict
+
+warnings.filterwarnings('ignore')
+
+# --- Parámetros de Configuración ---
+
+# 1. Rutas de Entrada y Salida
+INERTIAL_DATA_DIR = 'datasets/UTD-MHAD/Inertial'
+# Directorio temporal para almacenar todas las imágenes generadas antes de dividirlas
+TEMP_OUTPUT_DIR = 'datasets/Processed/Inertial_Images_Temp'
+# Directorio final donde se guardarán los conjuntos train/validation/test
+SPLIT_OUTPUT_DIR = 'datasets/Split_Data_Inertial'
+
+# 2. Parámetros de Generación de Imagen (según el paper)
+IMG_SIZE = (64, 64)
+SEQUENCE_LENGTH = 52  # Longitud de la secuencia según el paper
+
+# 3. Parámetros de Aumento de Datos (Augmentation)
+AUGMENTATION_CONFIG = {
+    'signal_augmentation': True,
+    'image_augmentation': True,
+    'augmentation_factor': 4,  # Número de versiones augmentadas por señal original
+    'time_warp_sigma': 0.2,
+    'noise_factor': 0.05,
+    'scale_range': (0.8, 1.2),
+    'rotation_range': 5,
+    'translation_range': 0.1,
+    'contrast_range': (0.8, 1.2),
+    'brightness_range': (-0.1, 0.1)
+}
+
+# 4. Parámetros de División del Dataset
+TRAIN_RATIO = 0.70
+VALIDATION_RATIO = 0.15
+TEST_RATIO = 0.15
+RANDOM_SEED = 42 # Para reproducibilidad
+
+# --- Funciones de Aumento (Sin cambios) ---
+class SignalAugmentation:
+    # ... (El código de SignalAugmentation se mantiene idéntico al original que proporcionaste)
+    @staticmethod
+    def time_warp(signal: np.ndarray, sigma: float = 0.2) -> np.ndarray:
+        T, C = signal.shape; n_control_points = max(3, T // 20); control_points = np.unique(np.random.randint(0, T, n_control_points * 2))[:n_control_points]; control_points = np.sort(control_points)
+        if len(control_points) < 3: control_points = np.array([0, T//2, T-1])
+        control_points[0] = 0; control_points[-1] = T - 1; control_points = np.unique(control_points)
+        if len(control_points) < 3: return signal * np.random.uniform(0.8, 1.2)
+        warp_factors = np.random.normal(1.0, sigma, len(control_points)); warp_factors = np.clip(warp_factors, 0.5, 2.0)
+        try:
+            interp_func = interp1d(control_points, warp_factors, kind='linear'); warp_profile = interp_func(np.arange(T)); warped_signal = np.zeros_like(signal)
+            cumulative_warp = np.cumsum(warp_profile); cumulative_warp = cumulative_warp / cumulative_warp[-1] * (T - 1)
+            for c in range(C): interp_func = interp1d(np.arange(T), signal[:, c], kind='linear', fill_value='extrapolate'); warped_signal[:, c] = interp_func(cumulative_warp)
+            return warped_signal
+        except Exception: return signal
+    @staticmethod
+    def temporal_shift(signal: np.ndarray, max_shift_ratio: float = 0.25) -> np.ndarray:
+        T = signal.shape[0]; max_shift = int(T * max_shift_ratio); shift = np.random.randint(-max_shift, max_shift + 1); return np.roll(signal, shift, axis=0)
+    @staticmethod
+    def amplitude_scaling(signal: np.ndarray, scale_range: Tuple[float, float] = (0.8, 1.2)) -> np.ndarray:
+        return signal * np.random.uniform(scale_range[0], scale_range[1])
+    @staticmethod
+    def add_noise(signal: np.ndarray, noise_factor: float = 0.05) -> np.ndarray:
+        signal_std = np.std(signal); noise = np.random.normal(0, noise_factor * signal_std, signal.shape); return signal + noise
+    @staticmethod
+    def channel_shuffle(signal: np.ndarray, shuffle_prob: float = 0.5) -> np.ndarray:
+        if np.random.random() > shuffle_prob: return signal
+        augmented_signal = signal.copy()
+        if np.random.random() > 0.5: accel_indices = np.random.permutation([0, 1, 2]); augmented_signal[:, [0, 1, 2]] = signal[:, accel_indices]
+        if np.random.random() > 0.5: gyro_indices = np.random.permutation([3, 4, 5]); augmented_signal[:, [3, 4, 5]] = signal[:, gyro_indices]
+        return augmented_signal
+
+class ImageAugmentation:
+    # ... (El código de ImageAugmentation se mantiene idéntico al original que proporcionaste)
+    @staticmethod
+    def rotate(image: Image.Image, max_angle: float = 5.0) -> Image.Image:
+        return image.rotate(np.random.uniform(-max_angle, max_angle), fillcolor=0)
+    @staticmethod
+    def translate(image: Image.Image, max_translation: float = 0.1) -> Image.Image:
+        width, height = image.size; dx = int(np.random.uniform(-max_translation, max_translation) * width); dy = int(np.random.uniform(-max_translation, max_translation) * height)
+        return image.transform(image.size, Image.AFFINE, (1, 0, dx, 0, 1, dy), fillcolor=0)
+    @staticmethod
+    def adjust_contrast(image: Image.Image, contrast_range: Tuple[float, float] = (0.8, 1.2)) -> Image.Image:
+        return ImageEnhance.Contrast(image).enhance(np.random.uniform(contrast_range[0], contrast_range[1]))
+    @staticmethod
+    def adjust_brightness(image: Image.Image, brightness_range: Tuple[float, float] = (-0.1, 0.1)) -> Image.Image:
+        return ImageEnhance.Brightness(image).enhance(1.0 + np.random.uniform(brightness_range[0], brightness_range[1]))
+
+# --- Funciones de Generación y Procesamiento (MODIFICADAS) ---
+
+def get_info_from_filename(filename: str) -> Tuple[str, str]:
+    """Extrae clase y nombre de la muestra del nombre de archivo."""
+    parts = os.path.splitext(filename)[0].split('_')
+    class_name = parts[0]
+    sample_name = '_'.join(parts[:-1])
+    return class_name, sample_name
+
+def normalize_signal(signal_data: np.ndarray) -> np.ndarray:
+    """Normaliza la señal completa (no por canal) entre 0 y 1 para mantener relaciones."""
+    min_val = np.min(signal_data)
+    max_val = np.max(signal_data)
+    range_val = max_val - min_val
+    if range_val == 0:
+        return np.zeros(signal_data.shape)
+    return (signal_data - min_val) / range_val
+
+def signal_to_image_from_paper(signal: np.ndarray) -> Image.Image:
+    """
+    Convierte una secuencia de señal (T, 6) a una imagen según el método del paper.
+    """
+    if signal.shape[0] > SEQUENCE_LENGTH:
+        signal = signal[:SEQUENCE_LENGTH, :]
+    elif signal.shape[0] < SEQUENCE_LENGTH:
+        padding = np.zeros((SEQUENCE_LENGTH - signal.shape[0], signal.shape[1]))
+        signal = np.vstack((signal, padding))
+
+    norm_signal = normalize_signal(signal)
+    s = norm_signal.T  # Shape (6, 52)
+    
+    # Permutaciones de índices (0-5) para crear los 4 bloques
+    p1 = s[[0, 1, 2, 3, 4, 5], :]
+    p2 = s[[0, 2, 4, 1, 3, 5], :]
+    p3 = s[[0, 3, 1, 4, 2, 5], :]
+    p4 = s[[0, 4, 1, 5, 2, 3], :]
+    
+    img_array_intermediate = np.vstack((p1, p2, p3, p4))  # Shape (24, 52)
+    img_array_uint8 = (img_array_intermediate * 255).astype(np.uint8)
+    resized_img = cv2.resize(img_array_uint8, IMG_SIZE, interpolation=cv2.INTER_LINEAR)
+    
+    return Image.fromarray(resized_img, 'L')
+
+def apply_signal_augmentation(signal: np.ndarray, aug_type: str) -> np.ndarray:
+    """Aplica un tipo específico de augmentation a la señal."""
+    aug_map = {
+        'time_warp': lambda s: SignalAugmentation.time_warp(s, AUGMENTATION_CONFIG['time_warp_sigma']),
+        'temporal_shift': SignalAugmentation.temporal_shift,
+        'scaling': lambda s: SignalAugmentation.amplitude_scaling(s, AUGMENTATION_CONFIG['scale_range']),
+        'noise': lambda s: SignalAugmentation.add_noise(s, AUGMENTATION_CONFIG['noise_factor']),
+        'channel_shuffle': SignalAugmentation.channel_shuffle,
+    }
+    return aug_map.get(aug_type, lambda s: s)(signal)
+
+def apply_image_augmentation(image: Image.Image, aug_type: str) -> Image.Image:
+    """Aplica un tipo específico de augmentation a la imagen."""
+    aug_map = {
+        'rotation': lambda img: ImageAugmentation.rotate(img, AUGMENTATION_CONFIG['rotation_range']),
+        'translation': lambda img: ImageAugmentation.translate(img, AUGMENTATION_CONFIG['translation_range']),
+        'contrast': lambda img: ImageAugmentation.adjust_contrast(img, AUGMENTATION_CONFIG['contrast_range']),
+        'brightness': lambda img: ImageAugmentation.adjust_brightness(img, AUGMENTATION_CONFIG['brightness_range']),
+    }
+    return aug_map.get(aug_type, lambda img: img)(image)
+
+def generate_augmented_samples(original_signal: np.ndarray, sample_name: str, class_dir: str) -> int:
+    """Genera múltiples versiones augmentadas de una señal."""
+    samples_created = 0
+    
+    original_image = signal_to_image_from_paper(original_signal)
+    original_image.save(os.path.join(class_dir, f"{sample_name}_inertial_original.png"))
+    samples_created += 1
+    
+    signal_augmentations = ['time_warp', 'temporal_shift', 'scaling', 'noise', 'channel_shuffle']
+    image_augmentations = ['rotation', 'translation', 'contrast', 'brightness']
+    
+    for i in range(AUGMENTATION_CONFIG['augmentation_factor']):
+        augmented_signal = original_signal.copy()
+        if AUGMENTATION_CONFIG['signal_augmentation']:
+            for aug_type in np.random.choice(signal_augmentations, np.random.randint(1, 3), replace=False):
+                augmented_signal = apply_signal_augmentation(augmented_signal, aug_type)
+        
+        augmented_image = signal_to_image_from_paper(augmented_signal)
+        
+        if AUGMENTATION_CONFIG['image_augmentation']:
+            for aug_type in np.random.choice(image_augmentations, np.random.randint(1, 3), replace=False):
+                augmented_image = apply_image_augmentation(augmented_image, aug_type)
+        
+        augmented_image.save(os.path.join(class_dir, f"{sample_name}_inertial_aug_{i+1}.png"))
+        samples_created += 1
+    
+    return samples_created
+
+def get_sample_name_from_filename(filename: str) -> str:
+    """Extrae el nombre base (e.g., 'a1_s1_v1') de un nombre de archivo completo."""
+    return '_'.join(filename.split('_')[:3])
+
+# --- Script Principal ---
+def main():
+    if not abs(TRAIN_RATIO + VALIDATION_RATIO + TEST_RATIO - 1.0) < 1e-9:
+        raise ValueError("La suma de los ratios de división debe ser 1.0")
+
+    # --- PASO 1: Generación de Imágenes ---
+    print("🚀 PASO 1/2: Generando imágenes desde datos inerciales (con augmentation)...")
+    
+    if not os.path.exists(INERTIAL_DATA_DIR):
+        print(f"❌ ERROR: El directorio de entrada '{INERTIAL_DATA_DIR}' no existe.")
+        return
+
+    # Limpiar y crear directorio temporal
+    if os.path.exists(TEMP_OUTPUT_DIR):
+        shutil.rmtree(TEMP_OUTPUT_DIR)
+    os.makedirs(TEMP_OUTPUT_DIR)
+    
+    inertial_files = [f for f in os.listdir(INERTIAL_DATA_DIR) if f.endswith('.mat')]
+    if not inertial_files:
+        print(f"❌ ERROR: No se encontraron archivos .mat en '{INERTIAL_DATA_DIR}'.")
+        return
+        
+    print(f"📁 Encontrados {len(inertial_files)} archivos .mat.")
+    
+    np.random.seed(RANDOM_SEED)
+    random.seed(RANDOM_SEED)
+    
+    total_images_generated = 0
+    for filename in tqdm(inertial_files, desc="Procesando Señales"):
+        try:
+            class_name, sample_name = get_info_from_filename(filename)
+            class_dir = os.path.join(TEMP_OUTPUT_DIR, class_name)
+            os.makedirs(class_dir, exist_ok=True)
+            
+            inertial_data = scipy.io.loadmat(os.path.join(INERTIAL_DATA_DIR, filename))['d_iner']
+            if inertial_data.shape[1] != 6: continue
+            
+            total_images_generated += generate_augmented_samples(inertial_data, sample_name, class_dir)
+        except Exception as e:
+            print(f"\n⚠️ Error procesando {filename}: {e}")
+    
+    print(f"\n✅ PASO 1 completado. Total de imágenes generadas: {total_images_generated}")
+
+    # --- PASO 2: División del Dataset ---
+    print("\n🚀 PASO 2/2: Dividiendo el dataset en train, validation y test...")
+
+    # Limpiar y crear directorios de salida finales
+    if os.path.exists(SPLIT_OUTPUT_DIR):
+        shutil.rmtree(SPLIT_OUTPUT_DIR)
+    train_path = os.path.join(SPLIT_OUTPUT_DIR, 'train')
+    val_path = os.path.join(SPLIT_OUTPUT_DIR, 'validation')
+    test_path = os.path.join(SPLIT_OUTPUT_DIR, 'test')
+    os.makedirs(train_path)
+    os.makedirs(val_path)
+    os.makedirs(test_path)
+
+    total_files_moved = 0
+    class_dirs = [d for d in os.listdir(TEMP_OUTPUT_DIR) if os.path.isdir(os.path.join(TEMP_OUTPUT_DIR, d))]
+
+    for class_name in tqdm(class_dirs, desc="Dividiendo Clases"):
+        class_dir_path = os.path.join(TEMP_OUTPUT_DIR, class_name)
+        
+        sample_files = defaultdict(list)
+        for filename in os.listdir(class_dir_path):
+            sample_name = get_sample_name_from_filename(filename)
+            sample_files[sample_name].append(filename)
+            
+        unique_samples = list(sample_files.keys())
+
+        if len(unique_samples) < 3:
+            print(f"\n⚠️ Advertencia: La clase '{class_name}' tiene solo {len(unique_samples)} muestras. Se asignarán todas a 'train'.")
+            train_samples, val_samples, test_samples = unique_samples, [], []
+        else:
+            train_samples, temp_samples = train_test_split(
+                unique_samples, test_size=(1 - TRAIN_RATIO), random_state=RANDOM_SEED)
+            relative_val_ratio = VALIDATION_RATIO / (VALIDATION_RATIO + TEST_RATIO)
+            val_samples, test_samples = train_test_split(
+                temp_samples, test_size=(1 - relative_val_ratio), random_state=RANDOM_SEED)
+        
+        datasets = {'train': (train_samples, train_path), 'validation': (val_samples, val_path), 'test': (test_samples, test_path)}
+        for samples, dest_base_path in datasets.values():
+            dest_class_path = os.path.join(dest_base_path, class_name)
+            os.makedirs(dest_class_path, exist_ok=True)
+            for sample_name in samples:
+                for filename in sample_files[sample_name]:
+                    shutil.move(os.path.join(class_dir_path, filename), os.path.join(dest_class_path, filename))
+                    total_files_moved += 1
+
+    # Limpiar el directorio temporal
+    shutil.rmtree(TEMP_OUTPUT_DIR)
+
+    print("\n✅ Proceso completado.")
+    print(f"📊 Total de archivos organizados: {total_files_moved}")
+    print(f"📂 Los conjuntos de datos están listos en:")
+    print(f"   - Entrenamiento: {train_path}")
+    print(f"   - Validación:    {val_path}")
+    print(f"   - Prueba:        {test_path}")
+
+
+if __name__ == '__main__':
+    main()
